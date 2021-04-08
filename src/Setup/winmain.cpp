@@ -53,9 +53,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	int exitCode = -1;
 	CString cmdLine(lpCmdLine);
 
+	HANDLE eventLog = RegisterEventSource(NULL, L"SquirrelSetup");
+	CUpdateRunner::LogToEventLog(eventLog, EVENTLOG_INFORMATION_TYPE, L"Squirrel Setup started.");
+
 	if (cmdLine.Find(L"--checkInstall") >= 0) {
 		// If we're already installed, exit as fast as possible
 		if (!MachineInstaller::ShouldSilentInstall()) {
+			CUpdateRunner::LogToEventLog(eventLog, EVENTLOG_SUCCESS, L"CheckInstall detected an existing install.");
 			return 0;
 		}
 
@@ -75,13 +79,14 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	bool attemptingToRerun = (cmdLine.Find(L"--rerunningWithoutUAC") >= 0);
 
 	if (weAreUACElevated && attemptingToRerun) {
-		CUpdateRunner::DisplayErrorMessage(CString(L"Please re-run this installer as a normal user instead of \"Run as Administrator\"."), NULL);
+		CUpdateRunner::DisplayErrorMessage(CString(L"Please re-run this installer as a normal user instead of \"Run as Administrator\"."), NULL, eventLog);
 		exitCode = E_FAIL;
 		goto out;
 	}
 
 	if (!CFxHelper::CanInstallDotNet4_5()) {
 		// Explain this as nicely as possible and give up.
+		CUpdateRunner::LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, L"This program cannot run on Windows XP or before; it requires a later version of Windows.");
 		MessageBox(0L, L"This program cannot run on Windows XP or before; it requires a later version of Windows.", L"Incompatible Operating System", 0);
 		exitCode = E_FAIL;
 		goto out;
@@ -93,7 +98,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		hr = CFxHelper::InstallDotNetFramework(requiredVersion, isQuiet);
 		if (FAILED(hr)) {
 			exitCode = hr; // #yolo
-			CUpdateRunner::DisplayErrorMessage(CString(L"Failed to install the .NET Framework, try installing the latest version manually"), NULL);
+			CUpdateRunner::DisplayErrorMessage(CString(L"Failed to install the .NET Framework, try installing the latest version manually"), NULL, eventLog);
 			goto out;
 		}
 	
@@ -112,14 +117,16 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		GetModuleFileNameW(hMod, buf, 4096);
 		wcscat(lpCmdLine, L" --rerunningWithoutUAC");
 
+		CUpdateRunner::LogToEventLog(eventLog, EVENTLOG_WARNING_TYPE, L"Squirrel Setup must not be run as UAC-elevated. Restarting without elevation.");
 		CUpdateRunner::ShellExecuteFromExplorer(buf, lpCmdLine);
 		exitCode = 0;
 		goto out;
 	}
 
-	exitCode = CUpdateRunner::ExtractUpdaterAndRun(lpCmdLine, false);
+	exitCode = CUpdateRunner::ExtractUpdaterAndRun(lpCmdLine, false, eventLog);
 
 out:
+	if (eventLog != NULL) DeregisterEventSource(eventLog);
 	_Module->Term();
 	return exitCode;
 }

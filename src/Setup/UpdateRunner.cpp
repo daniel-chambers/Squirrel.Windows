@@ -4,8 +4,16 @@
 #include "UpdateRunner.h"
 #include <vector>
 
-void CUpdateRunner::DisplayErrorMessage(CString& errorMessage, wchar_t* logFile)
+void CUpdateRunner::LogToEventLog(HANDLE eventLog, WORD eventType, LPCWSTR message)
 {
+	if (eventLog != NULL)
+		ReportEvent(eventLog, eventType, 0, 0, NULL, 1, 0, &message, NULL);
+}
+
+void CUpdateRunner::DisplayErrorMessage(CString& errorMessage, wchar_t* logFile, HANDLE eventLog)
+{
+	LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, (LPCWSTR)errorMessage);
+
 	CTaskDialog dlg;
 	TASKDIALOG_BUTTON buttons[] = {
 		{ 1, L"Open Setup Log", },
@@ -147,7 +155,7 @@ bool CUpdateRunner::DirectoryIsWritable(wchar_t * szPath)
 		return true;
 }
 
-int CUpdateRunner::ExtractUpdaterAndRun(wchar_t* lpCommandLine, bool useFallbackDir)
+int CUpdateRunner::ExtractUpdaterAndRun(wchar_t* lpCommandLine, bool useFallbackDir, HANDLE eventLog)
 {
 	PROCESS_INFORMATION pi = { 0 };
 	STARTUPINFO si = { 0 };
@@ -183,21 +191,27 @@ int CUpdateRunner::ExtractUpdaterAndRun(wchar_t* lpCommandLine, bool useFallback
 	if (!CreateDirectory(targetDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
 		wchar_t err[4096];
 		_swprintf_c(err, _countof(err), L"Unable to write to %s - IT policies may be restricting access to this folder", targetDir);
-		DisplayErrorMessage(CString(err), NULL);
+		DisplayErrorMessage(CString(err), NULL, eventLog);
 
 		return -1;
 	}
 
 gotADir:
-
+	
 	wcscat_s(targetDir, _countof(targetDir), L"\\SquirrelTemp");
+
+	wchar_t logMsg[4096];
+	swprintf_s(logMsg, L"Extracting installer files to %s", targetDir);
+	LogToEventLog(eventLog, EVENTLOG_INFORMATION_TYPE, logMsg);
 
 	if (!CreateDirectory(targetDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
 		wchar_t err[4096];
 		_swprintf_c(err, _countof(err), L"Unable to write to %s - IT policies may be restricting access to this folder", targetDir);
 
 		if (useFallbackDir) {
-			DisplayErrorMessage(CString(err), NULL);
+			DisplayErrorMessage(CString(err), NULL, eventLog);
+		} else {
+			LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
 		}
 
 		goto failedExtract;
@@ -206,11 +220,20 @@ gotADir:
 	swprintf_s(logFile, L"%s\\SquirrelSetup.log", targetDir);
 
 	if (!zipResource.Load(L"DATA", IDR_UPDATE_ZIP)) {
+		DWORD lastError = GetLastError();
+		wchar_t err[255];
+		swprintf_s(err, L"Unable to load the ZIP from resources. Error: 0x%08x", lastError);
+		LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
+
 		goto failedExtract;
 	}
 
 	DWORD dwSize = zipResource.GetSize();
 	if (dwSize < 0x100) {
+		wchar_t err[255];
+		swprintf_s(err, L"Unable to load the ZIP from resources; smaller than expected. Size: %u", dwSize);
+		LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
+
 		goto failedExtract;
 	}
 
@@ -220,13 +243,18 @@ gotADir:
 
 	// NB: This library is kind of a disaster
 	ZRESULT zr;
-	int index = 0;
-	do {
+	for (int index = 0; ; index++) {
 		ZIPENTRY zentry;
 		wchar_t targetFile[MAX_PATH];
 
 		zr = GetZipItem(zipFile, index, &zentry);
-		if (zr != ZR_OK && zr != ZR_MORE) {
+		if (zr != ZR_OK) {
+			if (zr != ZR_ARGS) { // ZR_ARGS is returned when you try to read beyond the last file in the zip
+				wchar_t err[255];
+				swprintf_s(err, L"Unable to load item %d from ZIP. Error: 0x%08x", index, zr);
+				LogToEventLog(eventLog, EVENTLOG_WARNING_TYPE, err);
+			}
+
 			break;
 		}
 
@@ -234,10 +262,16 @@ gotADir:
 		swprintf_s(targetFile, L"%s\\%s", targetDir, zentry.name);
 		DeleteFile(targetFile);
 
-		if (UnzipItem(zipFile, index, zentry.name) != ZR_OK) break;
+		ZRESULT unzipResult = UnzipItem(zipFile, index, zentry.name);
+		if (unzipResult != ZR_OK) {
+			wchar_t err[255];
+			swprintf_s(err, L"Unable to load item %d from ZIP. Error: 0x%08x", index, unzipResult);
+			LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
+
+			break;
+		}
 		to_delete.push_back(CString(targetFile));
-		index++;
-	} while (zr == ZR_MORE || zr == ZR_OK);
+	}
 
 	CloseZip(zipFile);
 	zipResource.Release();
@@ -247,6 +281,11 @@ gotADir:
 	swprintf_s(updateExePath, L"%s\\%s", targetDir, L"Update.exe");
 
 	if (GetFileAttributes(updateExePath) == INVALID_FILE_ATTRIBUTES) {
+		DWORD lastError = GetLastError();
+		wchar_t err[255];
+		swprintf_s(err, L"Failed to get attributes for Update.exe. Error: 0x%08x", lastError);
+		LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
+
 		goto failedExtract;
 	}
 
@@ -263,6 +302,11 @@ gotADir:
 	swprintf_s(cmd, L"\"%s\" --install . %s", updateExePath, lpCommandLine);
 
 	if (!CreateProcess(NULL, cmd, NULL, NULL, false, 0, NULL, targetDir, &si, &pi)) {
+		DWORD lastError = GetLastError();
+		wchar_t err[255];
+		swprintf_s(err, L"Failed to start Update.exe. Error: 0x%08x", lastError);
+		LogToEventLog(eventLog, EVENTLOG_ERROR_TYPE, err);
+
 		goto failedExtract;
 	}
 
@@ -276,7 +320,9 @@ gotADir:
 	if (dwExitCode != 0) {
 		DisplayErrorMessage(CString(
 			L"There was an error while installing the application. "
-			L"Check the setup log for more information and contact the author."), logFile);
+			L"Check the setup log for more information and contact the author."), logFile, eventLog);
+	} else {
+		LogToEventLog(eventLog, EVENTLOG_SUCCESS, L"Successfully installed");
 	}
 
 	for (unsigned int i = 0; i < to_delete.size(); i++) {
@@ -290,9 +336,9 @@ gotADir:
 failedExtract:
 	if (!useFallbackDir) {
 		// Take another pass at it, using C:\ProgramData instead
-		return ExtractUpdaterAndRun(lpCommandLine, true);
+		return ExtractUpdaterAndRun(lpCommandLine, true, eventLog);
 	}
 
-	DisplayErrorMessage(CString(L"Failed to extract installer"), NULL);
+	DisplayErrorMessage(CString(L"Failed to extract installer"), NULL, eventLog);
 	return (int) dwExitCode;
 }
